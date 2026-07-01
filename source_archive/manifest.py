@@ -50,6 +50,7 @@ def build_manifest(
     content_type: str | None,
     response_headers: dict[str, str],
     artifacts: dict[str, dict[str, Any]],
+    content_category: str = "html",
     wayback_url: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the manifest dictionary."""
@@ -58,6 +59,7 @@ def build_manifest(
         "captured_at": captured_at,
         "http_status": http_status,
         "content_type": content_type,
+        "content_category": content_category,
         "response_headers": response_headers,
         "artifacts": artifacts,
         "wayback_url": wayback_url,

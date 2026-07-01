@@ -8,6 +8,7 @@ outcomes without re-reading the manifest.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import shutil
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,58 @@ SCREENSHOT_NAME = "screenshot.png"
 ARTICLE_NAME = "article.txt"
 MANIFEST_NAME = "manifest.json"
 
+# Common MIME-type -> file-extension overrides. Used only for binary captures.
+# ``mimetypes`` from the stdlib fills the gaps; these overrides guarantee
+# predictable, human-friendly extensions for the types we see most often.
+COMMON_BINARY_EXTENSIONS = {
+    "application/pdf": "pdf",
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "application/zip": "zip",
+    "application/x-zip-compressed": "zip",
+    "application/octet-stream": "bin",
+}
+
+
+def classify_content_type(content_type: str | None) -> str:
+    """Classify a Content-Type header into 'html' or 'binary'.
+
+    HTML/XHTML and ``text/plain`` (kept for backward compatibility) are
+    treated as HTML. Anything else, including a missing or unknown type, is
+    treated as binary so that we never try to render non-HTML bytes.
+    """
+    if not content_type:
+        return "binary"
+    media_type = content_type.split(";")[0].strip().lower()
+    if media_type in ("text/html", "application/xhtml+xml", "text/plain"):
+        return "html"
+    return "binary"
+
+
+def _extension_for_content_type(content_type: str | None) -> str:
+    """Return a short file extension for ``content_type`` (without the dot).
+
+    Uses an explicit mapping for common types, then falls back to the stdlib
+    ``mimetypes`` module. Unknown or unparseable types return ``'bin'``.
+    """
+    if not content_type:
+        return "bin"
+    media_type = content_type.split(";")[0].strip().lower()
+    if media_type in COMMON_BINARY_EXTENSIONS:
+        return COMMON_BINARY_EXTENSIONS[media_type]
+    ext = mimetypes.guess_extension(media_type)
+    if ext:
+        return ext.lstrip(".")
+    return "bin"
+
+
+def _raw_binary_name(content_type: str | None) -> str:
+    """Return ``raw.<ext>`` for the given binary content type."""
+    return f"raw.{_extension_for_content_type(content_type)}"
+
 
 def capture_dir_for(output_dir: Path, url: str) -> Path:
     """Return ``<output_dir>/captures/<sha256(url)[:16]>`` for a URL."""
@@ -48,7 +101,7 @@ def capture_dir_for(output_dir: Path, url: str) -> Path:
 
 
 def _fetch(url: str, timeout: int) -> tuple[int, str | None, dict[str, str], bytes]:
-    """Fetch raw HTML + headers with requests. Raises on network failure."""
+    """Fetch raw response body + headers with requests. Raises on network failure."""
     resp = requests.get(
         url,
         timeout=timeout,
@@ -172,7 +225,7 @@ def capture_url(
     capture_dir.mkdir(parents=True, exist_ok=True)
     result["capture_hash"] = capture_hash
 
-    # --- 1. Fetch raw HTML + headers ---------------------------------------
+    # --- 1. Fetch raw bytes + headers --------------------------------------
     try:
         status, content_type, response_headers, raw_bytes = _fetch(url, timeout)
     except requests.RequestException as exc:
@@ -180,57 +233,67 @@ def capture_url(
         log.error("Capture failed for %s: %s", url, exc)
         return result
 
-    raw_html_path = capture_dir / RAW_HTML_NAME
-    raw_html_path.write_bytes(raw_bytes)
-    headers_path = capture_dir / HEADERS_NAME
+    content_category = classify_content_type(content_type)
+
+    # --- 2. Persist raw bytes + headers ------------------------------------
     import json
 
+    headers_path = capture_dir / HEADERS_NAME
     headers_path.write_text(
         json.dumps(response_headers, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 
-    # Decode raw HTML for text extraction.
-    try:
-        raw_html_text = raw_bytes.decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        raw_html_text = ""
-
-    # --- 2. Render with Playwright ----------------------------------------
-    rendered = _render_with_playwright(url, capture_dir, timeout)
-
-    # --- 3. Extract article text -------------------------------------------
-    article_path = _extract_article(raw_html_text, url, capture_dir)
-
-    # --- 4. Optional Wayback submission ------------------------------------
+    artifacts_desc: dict[str, dict[str, Any]] = {}
     wayback_url: str | None = None
+
+    if content_category == "html":
+        # --- HTML path: raw HTML, Playwright render, article extraction ----
+        raw_html_path = capture_dir / RAW_HTML_NAME
+        raw_html_path.write_bytes(raw_bytes)
+        artifacts_desc["raw_html"] = artifact_entry(RAW_HTML_NAME, raw_html_path)
+
+        try:
+            raw_html_text = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            raw_html_text = ""
+
+        rendered = _render_with_playwright(url, capture_dir, timeout)
+        if rendered:
+            if "singlefile_html" in rendered:
+                artifacts_desc["singlefile_html"] = artifact_entry(
+                    SINGLEFILE_NAME, rendered["singlefile_html"]
+                )
+            if "pdf" in rendered:
+                artifacts_desc["pdf"] = artifact_entry(PDF_NAME, rendered["pdf"])
+            if "screenshot" in rendered:
+                artifacts_desc["screenshot"] = artifact_entry(
+                    SCREENSHOT_NAME, rendered["screenshot"]
+                )
+
+        article_path = _extract_article(raw_html_text, url, capture_dir)
+        if article_path is not None:
+            artifacts_desc["article_text"] = artifact_entry(ARTICLE_NAME, article_path)
+    else:
+        # --- Binary path: save raw bytes with an appropriate extension -----
+        raw_binary_name = _raw_binary_name(content_type)
+        raw_binary_path = capture_dir / raw_binary_name
+        raw_binary_path.write_bytes(raw_bytes)
+        artifacts_desc["raw_binary"] = artifact_entry(raw_binary_name, raw_binary_path)
+
+    # --- 3. Optional Wayback submission ------------------------------------
     if wayback:
         wayback_url = save_to_wayback(url)
         if wayback_url is None:
             log.warning("Wayback capture skipped/failed for %s", url)
 
-    # --- 5. Build manifest with artifact descriptors ----------------------
-    artifacts_desc: dict[str, dict[str, Any]] = {}
-    artifacts_desc["raw_html"] = artifact_entry(RAW_HTML_NAME, raw_html_path)
-    if rendered:
-        if "singlefile_html" in rendered:
-            artifacts_desc["singlefile_html"] = artifact_entry(
-                SINGLEFILE_NAME, rendered["singlefile_html"]
-            )
-        if "pdf" in rendered:
-            artifacts_desc["pdf"] = artifact_entry(PDF_NAME, rendered["pdf"])
-        if "screenshot" in rendered:
-            artifacts_desc["screenshot"] = artifact_entry(
-                SCREENSHOT_NAME, rendered["screenshot"]
-            )
-    if article_path is not None:
-        artifacts_desc["article_text"] = artifact_entry(ARTICLE_NAME, article_path)
-
+    # --- 4. Build manifest with artifact descriptors ----------------------
     manifest = build_manifest(
         url=url,
         captured_at=captured_at,
         http_status=status,
         content_type=content_type,
+        content_category=content_category,
         response_headers=response_headers,
         artifacts=artifacts_desc,
         wayback_url=wayback_url,
@@ -247,7 +310,7 @@ def capture_url(
         }
     )
 
-    # --- 6. Insert into SQLite index --------------------------------------
+    # --- 5. Insert into SQLite index --------------------------------------
     from .db import get_db_path, init_db, insert_capture
 
     db_path = get_db_path(output_dir)
