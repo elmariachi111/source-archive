@@ -1,0 +1,11 @@
+# Local captures / archive output
+archive/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Test artifacts
+.pytest_cache/

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "source-archive"
+version = "0.1.0"
+description = "Capture and preserve web content at the moment of citation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Climate Publishing Team" }]
+dependencies = [
+    "click>=8.1",
+    "requests>=2.28",
+    "playwright>=1.40",
+    "trafilatura>=1.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+source-archive = "source_archive.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["source_archive*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
