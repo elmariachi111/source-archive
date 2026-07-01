@@ -300,13 +300,13 @@ def test_render_and_capture_intercepts_responses(tmp_path: Path) -> None:
 
     subresource = mock.Mock()
     subresource.url = "https://example.com/style.css"
-    subresource.status.return_value = 200
+    subresource.status = 200
     subresource.headers = {"Content-Type": "text/css"}
     subresource.body.return_value = b"body { color: black; }"
 
     main_response = mock.Mock()
     main_response.url = "https://example.com/article"
-    main_response.status.return_value = 200
+    main_response.status = 200
     main_response.headers = {"Content-Type": "text/html; charset=utf-8"}
     main_response.body.return_value = SAMPLE_HTML.encode("utf-8")
 

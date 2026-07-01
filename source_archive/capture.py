@@ -272,7 +272,7 @@ def _render_and_capture(
         responses.append(
             {
                 "url": response.url,
-                "status": response.status(),
+                "status": response.status,
                 "headers": dict(response.headers),
                 "body": body,
             }
@@ -301,7 +301,7 @@ def _render_and_capture(
                 return {
                     "screenshot": screenshot_path,
                     "responses": responses,
-                    "main_response_status": main_response.status(),
+                    "main_response_status": main_response.status,
                     "main_response_headers": {
                         k.lower(): v for k, v in main_response.headers.items()
                     },
