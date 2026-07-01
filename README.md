@@ -18,8 +18,9 @@ No existing single tool does all of this:
 ## Architecture
 
 ### Phase 1 — Local Capture (current)
-- CLI tool: `source-archive capture <url>` 
-- Downloads URL content locally in multiple formats: HTML, single-file HTML, PDF, plain text, screenshot PNG
+- CLI tool: `source-archive capture <url>`
+- Captures HTML pages as a standards-compliant WARC file (page + sub-resources), plus a full-page screenshot PNG and extracted article text
+- Downloads binary URLs (PDFs, images, etc.) as `raw.<ext>`
 - Computes SHA-256 hash of each artifact
 - Creates a manifest JSON per capture (URL, timestamp, formats, hashes, original headers)
 - Optionally pushes to Internet Archive Wayback Machine (SPN2 API) for public redundancy
