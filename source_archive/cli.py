@@ -19,6 +19,7 @@ from pathlib import Path
 import click
 
 from . import __version__
+from .article import capture_article_sources
 from .capture import capture_url, capture_urls
 from .db import count_artifacts, get_db_path, list_captures, load_manifest, lookup_capture
 
@@ -112,6 +113,76 @@ def batch(file: Path, wayback: bool, output_dir: str, delay: float, timeout: int
             click.echo(f"  {r['url']} — {r['error']}")
 
     if failed:
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# article
+# --------------------------------------------------------------------------
+@cli.command()
+@click.argument("url_or_file")
+@click.option("--wayback", is_flag=True, help="Also submit each source to the Wayback Machine.")
+@click.option("--output-dir", default=DEFAULT_OUTPUT_DIR, show_default=True, help="Directory for captures.")
+@click.option("--timeout", default=30, show_default=True, help="HTTP/Playwright timeout in seconds.")
+@click.option("--dry-run", is_flag=True, help="List remote sources without capturing them.")
+def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_run: bool) -> None:
+    """Extract remote source links from an article and capture each one."""
+    try:
+        result = capture_article_sources(
+            url_or_file,
+            output_dir=Path(output_dir),
+            wayback=wayback,
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        click.secho(f"Failed to read article: {exc}", fg="red", bold=True)
+        sys.exit(1)
+
+    click.echo(f"Article: {result['article_url']}")
+    click.echo(f"Domain: {result['article_domain']}")
+    click.echo("")
+
+    excluded = result["excluded"]
+    click.echo(f"Found {result['total_links']} total links")
+    click.echo(f"  - {excluded['internal']} internal (excluded)")
+    click.echo(f"  - {excluded['social']} social media (excluded)")
+    click.echo(f"  - {excluded['duplicates']} duplicates (excluded)")
+
+    if dry_run:
+        click.echo(f"\nDry run — would capture {result['remote_sources']} remote sources:")
+        for i, source in enumerate(result["sources"], start=1):
+            click.echo(f"  [{i}] {source['url']}")
+        return
+
+    click.echo(f"\nCapturing {result['remote_sources']} remote sources...")
+    for i, source in enumerate(result["sources"], start=1):
+        total = result["remote_sources"]
+        if source["ok"]:
+            warc_path = source.get("warc_path")
+            size = ""
+            if warc_path:
+                try:
+                    size_bytes = Path(warc_path).stat().st_size
+                    size = f", {size_bytes / (1024 * 1024):.1f} MB"
+                except OSError:
+                    pass
+            click.echo(
+                f"  [{i}/{total}] {source['url']} → OK ({Path(warc_path).name if warc_path else 'capture.warc.gz'}{size})"
+            )
+        else:
+            click.echo(
+                f"  [{i}/{total}] {source['url']} → FAIL ({source.get('error') or 'unknown error'})"
+            )
+
+    click.echo("")
+    click.secho(
+        f"Done: {result['succeeded']}/{result['remote_sources']} captured successfully, {result['failed']} failed",
+        bold=True,
+    )
+    click.echo(f"Captures stored in: {result['output_dir']}")
+
+    if result["failed"]:
         sys.exit(1)
 
 
