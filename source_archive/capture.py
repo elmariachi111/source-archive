@@ -240,14 +240,18 @@ def _extract_article(raw_html: str, url: str, dest_dir: Path) -> Path | None:
 
 
 def _render_and_capture(
-    url: str, dest_dir: Path, timeout: int
+    url: str,
+    dest_dir: Path,
+    timeout: int,
+    *,
+    screenshot: bool = True,
 ) -> dict[str, Any] | None:
     """Render the page with headless Chromium and capture network traffic.
 
-    Intercepts every HTTP response during ``page.goto()``, writes a full-page
-    screenshot, and returns a dict with:
+    Intercepts every HTTP response during ``page.goto()`` and returns a dict
+    with:
 
-        - ``screenshot``: Path to screenshot.png
+        - ``screenshot``: Path to screenshot.png (``None`` if ``screenshot=False``)
         - ``responses``: list of intercepted response dicts
         - ``main_response_status``: status code of the main navigation
         - ``main_response_headers``: response headers of the main navigation
@@ -259,7 +263,7 @@ def _render_and_capture(
     from playwright.sync_api import sync_playwright
 
     responses: list[dict[str, Any]] = []
-    screenshot_path = dest_dir / SCREENSHOT_NAME
+    screenshot_path = dest_dir / SCREENSHOT_NAME if screenshot else None
 
     def _handle_response(response) -> None:
         try:
@@ -294,18 +298,20 @@ def _render_and_capture(
                     )
                     return None
 
-                screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(screenshot_path), full_page=True)
+                if screenshot_path is not None:
+                    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(screenshot_path), full_page=True)
                 html = page.content()
+                main_response_headers = {
+                    k.lower(): v for k, v in main_response.headers.items()
+                }
 
                 return {
                     "screenshot": screenshot_path,
                     "responses": responses,
                     "main_response_status": main_response.status,
-                    "main_response_headers": {
-                        k.lower(): v for k, v in main_response.headers.items()
-                    },
-                    "main_content_type": main_response.headers.get("Content-Type"),
+                    "main_response_headers": main_response_headers,
+                    "main_content_type": main_response_headers.get("content-type"),
                     "html": html,
                 }
             finally:
@@ -317,7 +323,7 @@ def _render_and_capture(
             exc,
         )
         # Clean up partial screenshot.
-        if screenshot_path.exists():
+        if screenshot_path is not None and screenshot_path.exists():
             try:
                 screenshot_path.unlink()
             except OSError:

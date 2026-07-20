@@ -158,28 +158,28 @@ def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_
     click.echo(f"\nCapturing {result['remote_sources']} remote sources...")
     for i, source in enumerate(result["sources"], start=1):
         total = result["remote_sources"]
-        if source["ok"]:
-            warc_path = source.get("warc_path")
-            size = ""
-            if warc_path:
-                try:
-                    size_bytes = Path(warc_path).stat().st_size
-                    size = f", {size_bytes / (1024 * 1024):.1f} MB"
-                except OSError:
-                    pass
+        status = source.get("status")
+        if status == "ok":
+            content_type = source.get("content_type") or "unknown"
+            records = source.get("warc_records", 0)
             click.echo(
-                f"  [{i}/{total}] {source['url']} → OK ({Path(warc_path).name if warc_path else 'capture.warc.gz'}{size})"
+                f"  [{i}/{total}] {source['url']} → OK ({content_type}, {records} records)"
             )
-        else:
+        elif status == "failed":
             click.echo(
                 f"  [{i}/{total}] {source['url']} → FAIL ({source.get('error') or 'unknown error'})"
             )
+        else:
+            click.echo(f"  [{i}/{total}] {source['url']} → {status}")
 
     click.echo("")
     click.secho(
         f"Done: {result['succeeded']}/{result['remote_sources']} captured successfully, {result['failed']} failed",
         bold=True,
     )
+    click.echo(f"Bundle WARC: {result.get('bundle_warc_path') or 'bundle.warc.gz'}")
+    click.echo(f"Article HTML: {result.get('article_html_path') or 'article.html'}")
+    click.echo(f"Sources index: {result['sources_path']}")
     click.echo(f"Captures stored in: {result['output_dir']}")
 
     if result["failed"]:
