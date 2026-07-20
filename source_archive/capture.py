@@ -494,11 +494,34 @@ def capture_url(
             else:
                 # HEAD said HTML but the GET body was binary. Treat as binary.
                 _write_headers_json(capture_dir, response_headers)
+                artifacts_desc["headers"] = artifact_entry(
+                    HEADERS_NAME, capture_dir / HEADERS_NAME
+                )
                 raw_binary_name = _raw_binary_name(content_type)
                 raw_binary_path = capture_dir / raw_binary_name
                 raw_binary_path.write_bytes(raw_bytes)
                 artifacts_desc["raw_binary"] = artifact_entry(
                     raw_binary_name, raw_binary_path
+                )
+                _write_warc(
+                    capture_dir / WARC_NAME,
+                    url,
+                    [
+                        {
+                            "url": url,
+                            "status": status,
+                            "headers": response_headers,
+                            "body": raw_bytes,
+                        }
+                    ],
+                    {
+                        "software": f"source-archive/{__version__}",
+                        "format": "WARC File Format 1.0",
+                        "captured_at": captured_at,
+                    },
+                )
+                artifacts_desc["warc"] = artifact_entry(
+                    WARC_NAME, capture_dir / WARC_NAME
                 )
     else:
         # --- Binary path: save raw bytes with an appropriate extension ----------
@@ -513,12 +536,37 @@ def capture_url(
                 return result
 
         _write_headers_json(capture_dir, response_headers)
+        artifacts_desc["headers"] = artifact_entry(
+            HEADERS_NAME, capture_dir / HEADERS_NAME
+        )
+
         raw_binary_name = _raw_binary_name(content_type)
         raw_binary_path = capture_dir / raw_binary_name
         raw_binary_path.write_bytes(raw_bytes)
         artifacts_desc["raw_binary"] = artifact_entry(
             raw_binary_name, raw_binary_path
         )
+
+        # Write a WARC record for the binary response so every capture
+        # produces a sealed, replayable archive — not just HTML pages.
+        _write_warc(
+            capture_dir / WARC_NAME,
+            url,
+            [
+                {
+                    "url": url,
+                    "status": status,
+                    "headers": response_headers,
+                    "body": raw_bytes,
+                }
+            ],
+            {
+                "software": f"source-archive/{__version__}",
+                "format": "WARC File Format 1.0",
+                "captured_at": captured_at,
+            },
+        )
+        artifacts_desc["warc"] = artifact_entry(WARC_NAME, capture_dir / WARC_NAME)
 
     # --- 2. Optional Wayback submission ----------------------------------------
     if wayback:

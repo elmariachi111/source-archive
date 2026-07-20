@@ -257,7 +257,7 @@ def test_binary_capture_skips_render_and_extraction(temp_output: Path) -> None:
     manifest = json.loads(manifest_path.read_text("utf-8"))
     assert manifest["content_type"] == "image/png"
     assert manifest["content_category"] == "binary"
-    assert set(manifest["artifacts"]) == {"raw_binary"}
+    assert set(manifest["artifacts"]) == {"raw_binary", "headers", "warc"}
 
     raw_artifact = manifest["artifacts"]["raw_binary"]
     assert raw_artifact["path"] == "raw.png"
