@@ -26,6 +26,7 @@ from .manifest import (
     utc_now_iso,
     write_manifest,
 )
+from .wacz import IndexEntry
 from .wayback import save_to_wayback
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,13 @@ COMMON_BINARY_EXTENSIONS = {
     "application/x-zip-compressed": "zip",
     "application/octet-stream": "bin",
 }
+
+# Headers that describe the on-the-wire encoding of a body. ``requests`` and
+# Playwright both hand us the *decoded* body, so storing these verbatim makes
+# replay tools try to gunzip / de-chunk plain bytes and break the page. We keep
+# the original values under an ``x-archive-orig-`` prefix (pywb convention).
+_WIRE_ENCODING_HEADERS = ("content-encoding", "transfer-encoding", "content-length")
+ORIG_HEADER_PREFIX = "x-archive-orig-"
 
 
 def _user_agent() -> str:
@@ -170,38 +178,57 @@ def _classify(
     return category, content_type, headers, status, body
 
 
+def replay_safe_headers(
+    headers: dict[str, str] | list[tuple[str, str]], body_length: int
+) -> list[tuple[str, str]]:
+    """Make stored HTTP headers consistent with an already-decoded body.
+
+    Wire-encoding headers are renamed to ``x-archive-orig-<name>`` and a
+    ``content-length`` matching the stored body is added.
+    """
+    items = headers.items() if isinstance(headers, dict) else headers
+    result: list[tuple[str, str]] = []
+    for name, value in items:
+        if name.lower() in _WIRE_ENCODING_HEADERS:
+            result.append((ORIG_HEADER_PREFIX + name.lower(), value))
+        else:
+            result.append((name, value))
+    result.append(("content-length", str(body_length)))
+    return result
+
+
 def _write_warc(
     dest: Path,
     url: str,
     responses: list[dict[str, Any]],
     metadata: dict[str, str],
-) -> Path:
+) -> list[IndexEntry]:
     """Write a compressed WARC file with a metadata record + response records.
 
     ``responses`` is a list of dicts with keys ``url``, ``status``, ``headers``,
-    and ``body``. ``metadata`` is written as a ``metadata`` record using the
-    ``application/warc-fields`` content type.
+    ``body`` and optionally ``fetched_at`` (ISO-8601), which becomes the
+    record's ``WARC-Date``. ``metadata`` is written as a ``metadata`` record
+    using the ``application/warc-fields`` content type.
+
+    Returns one :class:`IndexEntry` per response record, for CDXJ indexing.
     """
     from warcio.statusandheaders import StatusAndHeaders
     from warcio.warcwriter import WARCWriter
 
+    index: list[IndexEntry] = []
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as out:
         writer = WARCWriter(out, gzip=True)
 
-        # Metadata record.
-        meta_body = (
-            f"software: {metadata['software']}\n"
-            f"format: {metadata['format']}\n"
-            f"captured_at: {metadata['captured_at']}\n"
+        # Metadata record: plain ``application/warc-fields``, no HTTP envelope.
+        meta_body = "".join(
+            f"{key}: {value}\n" for key, value in metadata.items()
         ).encode("utf-8")
-        meta_headers = StatusAndHeaders("200 OK", [])
         meta_record = writer.create_warc_record(
             url,
             "metadata",
             payload=BytesIO(meta_body),
             length=len(meta_body),
-            http_headers=meta_headers,
             warc_content_type="application/warc-fields",
         )
         writer.write_record(meta_record)
@@ -211,21 +238,35 @@ def _write_warc(
             status = item["status"]
             reason = _status_reason(status)
             status_line = f"HTTP/1.1 {status} {reason}"
-            header_list: list[tuple[str, str]] = [
-                (k, v) for k, v in item.get("headers", {}).items()
-            ]
-            http_headers = StatusAndHeaders(status_line, header_list)
             body = item.get("body") or b""
+            header_list = replay_safe_headers(item.get("headers", {}), len(body))
+            http_headers = StatusAndHeaders(status_line, header_list)
+            warc_date = item.get("fetched_at") or utc_now_iso()
             record = writer.create_warc_record(
                 item["url"],
                 "response",
                 payload=BytesIO(body),
                 length=len(body),
                 http_headers=http_headers,
+                warc_headers_dict={"WARC-Date": warc_date},
             )
+            offset = out.tell()
             writer.write_record(record)
+            content_type = http_headers.get_header("content-type") or ""
+            index.append(
+                IndexEntry(
+                    url=item["url"],
+                    warc_date=warc_date,
+                    status=status,
+                    mime=content_type.split(";")[0].strip(),
+                    digest=record.rec_headers.get_header("WARC-Payload-Digest") or "",
+                    offset=offset,
+                    length=out.tell() - offset,
+                    filename=dest.name,
+                )
+            )
 
-    return dest
+    return index
 
 
 def _write_headers_json(dest_dir: Path, headers: dict[str, str]) -> Path:
@@ -253,6 +294,113 @@ def _extract_article(raw_html: str, url: str, dest_dir: Path) -> Path | None:
     return article_path
 
 
+# Scroll through the page in viewport-sized steps so lazy-loaded content
+# (IntersectionObserver, loading="lazy") is requested. Capped for endless feeds.
+_AUTOSCROLL_JS = """
+async ({ maxSteps, pauseMs }) => {
+  const step = Math.max(window.innerHeight * 0.8, 400);
+  for (let i = 0, y = 0; i < maxSteps; i++, y += step) {
+    if (y > document.documentElement.scrollHeight) break;
+    window.scrollTo(0, y);
+    await new Promise((r) => setTimeout(r, pauseMs));
+  }
+  window.scrollTo(0, 0);
+}
+"""
+
+# Request every candidate of every srcset (and lazy data-src/data-srcset), plus
+# icon and preload links, so
+# replay finds whichever image size the *viewer's* browser picks. Candidates
+# are split on ", " since CDN URLs (e.g. Substack's) contain bare commas.
+_FETCH_IMAGE_VARIANTS_JS = """
+async ({ maxUrls }) => {
+  const urls = new Set();
+  const add = (u) => {
+    try {
+      const abs = new URL(u, document.baseURI);
+      if (abs.protocol === "http:" || abs.protocol === "https:") urls.add(abs.href);
+    } catch (e) {}
+  };
+  for (const el of document.querySelectorAll("img, source")) {
+    for (const attr of ["srcset", "data-srcset"]) {
+      const value = el.getAttribute(attr);
+      if (!value) continue;
+      for (const candidate of value.split(/,\\s+/)) {
+        const u = candidate.trim().split(/\\s+/)[0];
+        if (u) add(u.replace(/,$/, ""));
+      }
+    }
+    for (const attr of ["src", "data-src"]) {
+      const value = el.getAttribute(attr);
+      if (value && !value.startsWith("data:")) add(value);
+    }
+  }
+  // Icons and preloads: a headless browser skips them, a viewer's doesn't.
+  for (const link of document.querySelectorAll(
+    'link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="preload"]'
+  )) {
+    const href = link.getAttribute("href");
+    if (href) add(href);
+    const srcset = link.getAttribute("imagesrcset");
+    if (srcset) for (const c of srcset.split(/,\\s+/)) add(c.trim().split(/\\s+/)[0]);
+  }
+  const list = [...urls].slice(0, maxUrls);
+  await Promise.allSettled(
+    list.map((u) => fetch(u, { mode: "no-cors", credentials: "include" }))
+  );
+  return list.length;
+}
+"""
+
+AUTOSCROLL_MAX_STEPS = 60
+AUTOSCROLL_PAUSE_MS = 250
+MAX_IMAGE_VARIANTS = 400
+SETTLE_TIMEOUT_MS = 15_000
+
+
+SETTLE_QUIET_MS = 1_500
+SETTLE_POLL_MS = 250
+
+
+def _wait_until_quiet(page, responses: list[dict[str, Any]]) -> None:
+    """Wait until no new response has been recorded for ``SETTLE_QUIET_MS``.
+
+    ``wait_for_load_state("networkidle")`` returns at once if the page was
+    idle before, and response handlers only run while Playwright is waiting,
+    so we poll: each ``wait_for_timeout`` lets queued handlers read bodies.
+    Gives up after ``SETTLE_TIMEOUT_MS`` for pages that never go quiet.
+    """
+    waited = quiet = 0
+    last_count = len(responses)
+    while waited < SETTLE_TIMEOUT_MS and quiet < SETTLE_QUIET_MS:
+        page.wait_for_timeout(SETTLE_POLL_MS)
+        waited += SETTLE_POLL_MS
+        if len(responses) == last_count:
+            quiet += SETTLE_POLL_MS
+        else:
+            last_count, quiet = len(responses), 0
+
+
+def _load_deferred_content(page, responses: list[dict[str, Any]]) -> None:
+    """Trigger lazy loading and fetch all responsive image variants.
+
+    Best effort: a page that breaks either step is still captured as-is.
+    """
+    try:
+        page.evaluate(
+            _AUTOSCROLL_JS,
+            {"maxSteps": AUTOSCROLL_MAX_STEPS, "pauseMs": AUTOSCROLL_PAUSE_MS},
+        )
+        # Content appended by scrolling (related posts, avatars) needs to land
+        # in the DOM before its images can be collected.
+        _wait_until_quiet(page, responses)
+        fetched = page.evaluate(_FETCH_IMAGE_VARIANTS_JS, {"maxUrls": MAX_IMAGE_VARIANTS})
+        log.debug("Requested %s image variants for %s", fetched, page.url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Loading deferred content failed for %s: %s", page.url, exc)
+    _wait_until_quiet(page, responses)
+
+
 def _render_and_capture(
     url: str,
     dest_dir: Path,
@@ -266,7 +414,9 @@ def _render_and_capture(
     with:
 
         - ``screenshot``: Path to screenshot.png (``None`` if ``screenshot=False``)
-        - ``responses``: list of intercepted response dicts
+        - ``responses``: list of intercepted response dicts (incl. redirects)
+        - ``main_url``: final URL of the main navigation, after redirects
+        - ``title``: the rendered page's ``<title>``, or ``None``
         - ``main_response_status``: status code of the main navigation
         - ``main_response_headers``: response headers of the main navigation
         - ``main_content_type``: Content-Type of the main navigation
@@ -277,24 +427,40 @@ def _render_and_capture(
     from playwright.sync_api import sync_playwright
 
     responses: list[dict[str, Any]] = []
+    captured_ok: set[str] = set()
     screenshot_path = dest_dir / SCREENSHOT_NAME if screenshot else None
 
     def _handle_response(response) -> None:
-        try:
-            body = response.body()
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to read response body for %s: %s", response.url, exc
-            )
+        # blob:/data: URLs are browser-internal and cannot be replayed.
+        if not response.url.startswith(("http://", "https://")):
             return
+        # Re-requests (e.g. image variants already on the page) add nothing.
+        if response.url in captured_ok:
+            return
+        fetched_at = utc_now_iso()
+        if 300 <= response.status < 400:
+            # Redirects have no body, but keeping them lets a cited URL that
+            # redirects still resolve to its target during replay.
+            body = b""
+        else:
+            try:
+                body = response.body()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to read response body for %s: %s", response.url, exc
+                )
+                return
         responses.append(
             {
                 "url": response.url,
                 "status": response.status,
                 "headers": dict(response.headers),
                 "body": body,
+                "fetched_at": fetched_at,
             }
         )
+        if 200 <= response.status < 300:
+            captured_ok.add(response.url)
 
     try:
         with sync_playwright() as p:
@@ -312,6 +478,8 @@ def _render_and_capture(
                     )
                     return None
 
+                _load_deferred_content(page, responses)
+
                 if screenshot_path is not None:
                     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
                     page.screenshot(path=str(screenshot_path), full_page=True)
@@ -323,6 +491,8 @@ def _render_and_capture(
                 return {
                     "screenshot": screenshot_path,
                     "responses": responses,
+                    "main_url": main_response.url,
+                    "title": page.title() or None,
                     "main_response_status": main_response.status,
                     "main_response_headers": main_response_headers,
                     "main_content_type": main_response_headers.get("content-type"),

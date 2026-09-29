@@ -65,6 +65,26 @@ source-archive list
 source-archive lookup https://example.com/article
 ```
 
+## Article bundles
+
+```bash
+source-archive article https://example.substack.com/p/some-post
+```
+
+captures the article and every external source it links to into
+`archive/article_<hash>/`:
+
+- `bundle.wacz` — one [WACZ](https://specs.webrecorder.net/wacz/1.1.1/) file: the WARC
+  (`archive/bundle.warc.gz`, every record dated with its real fetch time), a CDXJ index,
+  and a page list with the article first (titled `Article: …`) followed by each source
+- `article.html` — the article's raw HTML
+- `sources.json` — per-source status, final URL, title, and fetch time
+
+To browse a bundle, open https://replayweb.page and choose `bundle.wacz` (it is read
+locally in the browser, nothing is uploaded), or use the ReplayWeb.page desktop app.
+The WARC can be extracted with `unzip bundle.wacz archive/bundle.warc.gz` for tools
+that need a plain WARC.
+
 ## License
 
 MIT

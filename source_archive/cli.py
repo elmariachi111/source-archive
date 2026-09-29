@@ -148,6 +148,8 @@ def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_
     click.echo(f"  - {excluded['internal']} internal (excluded)")
     click.echo(f"  - {excluded['social']} social media (excluded)")
     click.echo(f"  - {excluded['duplicates']} duplicates (excluded)")
+    if excluded.get("noscript"):
+        click.echo(f"  - {excluded['noscript']} inside <noscript> (excluded)")
 
     if dry_run:
         click.echo(f"\nDry run — would capture {result['remote_sources']} remote sources:")
@@ -177,7 +179,8 @@ def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_
         f"Done: {result['succeeded']}/{result['remote_sources']} captured successfully, {result['failed']} failed",
         bold=True,
     )
-    click.echo(f"Bundle WARC: {result.get('bundle_warc_path') or 'bundle.warc.gz'}")
+    click.echo(f"Bundle (WACZ): {result.get('bundle_wacz_path') or 'bundle.wacz'}")
+    click.echo("  open it at https://replayweb.page (loads locally, nothing is uploaded)")
     click.echo(f"Article HTML: {result.get('article_html_path') or 'article.html'}")
     click.echo(f"Sources index: {result['sources_path']}")
     click.echo(f"Captures stored in: {result['output_dir']}")

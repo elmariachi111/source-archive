@@ -399,3 +399,44 @@ def test_cli_capture_normalizes_output_dir_ending_in_captures() -> None:
     # Output should refer to the effective archive root, not the nested captures dir.
     assert "archive/captures/" in invoke.output
     assert "archive/captures/captures/" not in invoke.output
+
+
+def test_write_warc_neutralizes_wire_encoding_headers(tmp_path: Path) -> None:
+    """Decoded bodies must not be stored under gzip/chunked/stale-length headers."""
+    body = b"<html><body>decoded</body></html>"
+    dest = tmp_path / "out.warc.gz"
+    capture_mod._write_warc(
+        dest,
+        "https://example.com/a",
+        [
+            {
+                "url": "https://example.com/a",
+                "status": 200,
+                "headers": {
+                    "content-type": "text/html",
+                    "content-encoding": "gzip",
+                    "transfer-encoding": "chunked",
+                    "content-length": "12",
+                },
+                "body": body,
+            }
+        ],
+        {"software": "test", "captured_at": "2026-01-01T00:00:00Z", "article_url": "https://example.com/a"},
+    )
+
+    with dest.open("rb") as fh:
+        pairs = [(r, r.content_stream().read()) for r in ArchiveIterator(fh)]
+    (meta, _), (resp, _) = pairs
+    payloads = [payload for _, payload in pairs]
+
+    assert meta.rec_type == "metadata"
+    assert meta.http_headers is None
+    assert b"article_url: https://example.com/a" in payloads[0]
+
+    headers = resp.http_headers
+    assert headers.get_header("content-encoding") is None
+    assert headers.get_header("transfer-encoding") is None
+    assert headers.get_header("content-length") == str(len(body))
+    assert headers.get_header("x-archive-orig-content-encoding") == "gzip"
+    assert headers.get_header("x-archive-orig-transfer-encoding") == "chunked"
+    assert payloads[1] == body
