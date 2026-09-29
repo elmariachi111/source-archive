@@ -101,6 +101,20 @@ def _raw_binary_name(content_type: str | None) -> str:
     return f"raw.{_extension_for_content_type(content_type)}"
 
 
+def normalize_output_dir(output_dir: Path) -> Path:
+    """Return the effective archive root for ``output_dir``.
+
+    If the final path component is literally ``captures``, treat the parent
+    directory as the archive root.  This prevents accidental double nesting
+    when users pass ``--output-dir .../archive/captures`` (the old documented
+    example): captures then land in ``<parent>/captures/<hash>`` and the index
+    lives at ``<parent>/index.db``.
+    """
+    if output_dir.name == "captures":
+        return output_dir.parent
+    return output_dir
+
+
 def capture_dir_for(output_dir: Path, url: str) -> Path:
     """Return ``<output_dir>/captures/<sha256(url)[:16]>`` for a URL."""
     prefix = sha256_text(url)[:16]

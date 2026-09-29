@@ -10,7 +10,7 @@ import pytest
 from warcio.archiveiterator import ArchiveIterator
 
 from source_archive import capture as capture_mod
-from source_archive.capture import capture_url, classify_content_type
+from source_archive.capture import capture_url, classify_content_type, normalize_output_dir
 
 
 SAMPLE_HTML = """
@@ -361,3 +361,41 @@ def test_render_and_capture_intercepts_responses(tmp_path: Path) -> None:
     assert result["main_content_type"] == "text/html; charset=utf-8"
     assert result["html"] == SAMPLE_HTML
     assert (dest_dir / "screenshot.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Output directory normalization
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_output_dir_unchanged_for_normal_directory() -> None:
+    assert normalize_output_dir(Path("/some/archive")) == Path("/some/archive")
+    assert normalize_output_dir(Path("archive")) == Path("archive")
+
+
+def test_normalize_output_dir_strips_trailing_captures() -> None:
+    assert normalize_output_dir(Path("/some/archive/captures")) == Path("/some/archive")
+    assert normalize_output_dir(Path("archive/captures")) == Path("archive")
+
+
+def test_cli_capture_normalizes_output_dir_ending_in_captures() -> None:
+    from click.testing import CliRunner
+    from source_archive.cli import cli
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(), (
+        mock.patch.object(capture_mod.requests, "head", side_effect=_fake_requests_head)
+    ), mock.patch.object(
+        capture_mod.requests, "get", side_effect=_fake_requests_get
+    ), mock.patch.object(
+        capture_mod, "_render_and_capture", side_effect=_fake_render_and_capture
+    ):
+        invoke = runner.invoke(
+            cli,
+            ["capture", "https://example.com/article", "--output-dir", "archive/captures"],
+        )
+
+    assert invoke.exit_code == 0, invoke.output
+    # Output should refer to the effective archive root, not the nested captures dir.
+    assert "archive/captures/" in invoke.output
+    assert "archive/captures/captures/" not in invoke.output

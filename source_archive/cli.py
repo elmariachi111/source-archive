@@ -20,7 +20,7 @@ import click
 
 from . import __version__
 from .article import capture_article_sources
-from .capture import capture_url, capture_urls
+from .capture import capture_url, capture_urls, normalize_output_dir
 from .db import count_artifacts, get_db_path, list_captures, load_manifest, lookup_capture
 
 DEFAULT_OUTPUT_DIR = "./archive"
@@ -53,7 +53,7 @@ def cli(verbose: bool) -> None:
 @click.option("--timeout", default=30, show_default=True, help="HTTP/Playwright timeout in seconds.")
 def capture(url: str, wayback: bool, output_dir: str, timeout: int) -> None:
     """Capture a single URL into durable local formats."""
-    out = Path(output_dir)
+    out = normalize_output_dir(Path(output_dir))
     click.echo(f"Capturing {url} → {out}/ ...")
     result = capture_url(url, output_dir=out, wayback=wayback, timeout=timeout)
     if result["ok"]:
@@ -94,7 +94,7 @@ def batch(file: Path, wayback: bool, output_dir: str, delay: float, timeout: int
     results = capture_urls(
         urls,
         delay=delay,
-        output_dir=Path(output_dir),
+        output_dir=normalize_output_dir(Path(output_dir)),
         wayback=wayback,
         timeout=timeout,
     )
@@ -130,7 +130,7 @@ def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_
     try:
         result = capture_article_sources(
             url_or_file,
-            output_dir=Path(output_dir),
+            output_dir=normalize_output_dir(Path(output_dir)),
             wayback=wayback,
             timeout=timeout,
             dry_run=dry_run,
