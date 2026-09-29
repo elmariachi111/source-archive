@@ -1,6 +1,9 @@
 # Local captures / archive output
 archive/
 
+# Packaged downloads
+dist/
+
 # Python
 __pycache__/
 *.pyc
