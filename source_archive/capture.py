@@ -17,6 +17,7 @@ from typing import Any
 
 import requests
 import trafilatura
+from urllib.parse import urlparse
 
 from . import __version__
 from .manifest import (
@@ -345,9 +346,21 @@ async ({ maxUrls }) => {
     if (srcset) for (const c of srcset.split(/,\\s+/)) add(c.trim().split(/\\s+/)[0]);
   }
   const list = [...urls].slice(0, maxUrls);
-  await Promise.allSettled(
-    list.map((u) => fetch(u, { mode: "no-cors", credentials: "include" }))
-  );
+  // Some pages (crusoe.ai, Oct 2026) hold fetch() promises forever — service
+  // worker interception can out-wait even AbortSignal. A setTimeout watchdog
+  // at the Promise.race level ALWAYS settles, so page.evaluate returns.
+  await Promise.race([
+    Promise.allSettled(
+      list.map((u) =>
+        fetch(u, {
+          mode: "no-cors",
+          credentials: "include",
+          signal: AbortSignal.timeout(10_000),
+        })
+      )
+    ),
+    new Promise((r) => setTimeout(r, 20_000)),
+  ]);
   return list.length;
 }
 """
@@ -430,6 +443,43 @@ def _render_and_capture(
     captured_ok: set[str] = set()
     screenshot_path = dest_dir / SCREENSHOT_NAME if screenshot else None
 
+    # Ad/telemetry/consent hosts that never yield archival content and can
+    # wedge response.body(): polling beacons (transcend.io fires every 5 min)
+    # block the sync handler forever waiting for a body that never completes.
+    # Markers are matched against the URL's NETLOC only — never the full URL:
+    # a substring like "ads." would false-positive on hosts like
+    # uploads.thirdway.org (real content CDN). Curated from mining 3 real
+    # bundles + capture logs (Oct 2026): 106 junk hosts, ~13% of records.
+    # Deliberately NOT included (content, despite the name): gstatic,
+    # googleapis/fonts, insights.carbon-direct.com (hosts cited PDFs),
+    # uploads.thirdway.org, disquscdn, addtoany, challenges.cloudflare.com,
+    # protect.clerk.com, sciencedirectassets.
+    _TRACKER_HOST_MARKERS = (  # validated by tests/test_tracker_filter.py
+        # ad exchanges / RTB / header bidding
+        "googlesyndication", "doubleclick", "googleads", "smartadserver",
+        "pubmatic", "adthrive", "teads", "smaato", "360yield", "adsrvr",
+        "amazon-adsystem", "projectagora", "taboola", "outbrain",
+        "ad.turn.com",
+        # publisher analytics / tag containers / engagement
+        "googletagmanager", "google-analytics", "analytics.google",
+        "chartbeat", "scorecardresearch", "quantserve", "clarity.ms",
+        "dotmetrics", "amplitude.com", "mixpanel", "matomo", "hotjar",
+        "newrelic", "nr-data", "hs-analytics", "hsadspixel",
+        "siteimproveanalytics", "sensic.net", "bttrack", "chimpstatic",
+        "mediarithmics", "dable.io", "ads-twitter", "cloudflareinsights",
+        "analytics.twitter", "analytics.ahrefs", "marketingplatform.google",
+        "ads.aeroxplorer.com",
+        "pixel-config.reddit", "alb.reddit", "redditmedia", "px.ads.linkedin",
+        "bat.bing", "ophan", "transcend", "plausible.io", "mybbc-analytics",
+        "metrics.brightcove", "metrics.rapidedge", "track.hubspot.com",
+        "tracker.oval.id", "gametrics.manufacturingdive.com",
+        # consent / cookie management (never archival content)
+        "onetrust", "consentmanager", "privacy-mgmt", "cookielaw",
+        "cookiebot", "cookieyes", "consentframework", "consentpro",
+        # misc adtech / data brokers
+        "flipp.com", "broadstreet", "pa-cd.com", "ffycdn", "btloader",
+    )
+
     def _handle_response(response) -> None:
         # blob:/data: URLs are browser-internal and cannot be replayed.
         if not response.url.startswith(("http://", "https://")):
@@ -437,6 +487,12 @@ def _render_and_capture(
         # Re-requests (e.g. image variants already on the page) add nothing.
         if response.url in captured_ok:
             return
+        # Skip ad/telemetry/consent hosts entirely — not archivable, and
+        # their response.body() may never resolve (hangs the whole capture).
+        netloc = urlparse(response.url).netloc
+        for marker in _TRACKER_HOST_MARKERS:
+            if marker in netloc:
+                return
         fetched_at = utc_now_iso()
         if 300 <= response.status < 400:
             # Redirects have no body, but keeping them lets a cited URL that
