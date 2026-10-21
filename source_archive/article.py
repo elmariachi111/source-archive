@@ -24,6 +24,7 @@ from urllib.parse import urldefrag, urljoin, urlparse
 import requests
 
 from . import __version__
+from .blocking import detect_block
 from .capture import (
     DEFAULT_OUTPUT_DIR,
     _classify,
@@ -249,7 +250,8 @@ class SourceCapture:
 
     ``responses`` are ``{"url", "status", "headers", "body", "fetched_at"}``
     dicts. ``page_url`` is the URL of the main document after redirects;
-    it may differ from the URL that was requested.
+    it may differ from the URL that was requested. ``block`` is set when what
+    came back is a geo/bot block page rather than the source.
     """
 
     responses: list[dict[str, Any]] = field(default_factory=list)
@@ -259,10 +261,15 @@ class SourceCapture:
     status: int | None = None
     page_url: str | None = None
     title: str | None = None
+    block: str | None = None
 
     def main_response(self) -> dict[str, Any] | None:
-        """The main document's (non-redirect) response record, if captured."""
-        for item in self.responses:
+        """The main document's (non-redirect) response record, if captured.
+
+        The last match wins: after a bot challenge the same URL is recorded
+        twice, challenge first, real page second.
+        """
+        for item in reversed(self.responses):
             if item["url"] == self.page_url and not 300 <= item["status"] < 400:
                 return item
         return None
@@ -299,6 +306,7 @@ def _single_response_capture(
     category: str | None,
 ) -> SourceCapture:
     """Wrap a plain ``requests`` fetch as a one-record capture."""
+    title = _html_title(body) if category == "html" else None
     return SourceCapture(
         responses=[
             {
@@ -313,7 +321,14 @@ def _single_response_capture(
         category=category,
         status=status,
         page_url=url,
-        title=_html_title(body) if category == "html" else None,
+        title=title,
+        block=detect_block(
+            status,
+            title,
+            body if category == "html" else None,
+            url=url,
+            headers=headers,
+        ),
     )
 
 
@@ -331,6 +346,7 @@ def _render(url: str, timeout: int) -> SourceCapture | None:
         status=rendered["main_response_status"],
         page_url=rendered["main_url"],
         title=rendered["title"],
+        block=rendered.get("block"),
     )
 
 
@@ -367,7 +383,12 @@ def _capture_article(url: str, timeout: int) -> tuple[SourceCapture, str, bytes]
     fetched at all.
     """
     rendered = _render(url, timeout)
-    if rendered and rendered.status is not None and rendered.status < 400:
+    if (
+        rendered
+        and not rendered.block
+        and rendered.status is not None
+        and rendered.status < 400
+    ):
         main = rendered.main_response()
         if main is not None and main["body"]:
             body = main["body"]
@@ -383,12 +404,19 @@ def _capture_article(url: str, timeout: int) -> tuple[SourceCapture, str, bytes]
 def _source_entry(url: str, capture: SourceCapture) -> dict[str, Any]:
     """One ``sources.json`` entry for a captured (or failed) source."""
     main = capture.main_response()
+    if capture.error:
+        status = "failed"
+    elif capture.block:
+        status = "blocked"
+    else:
+        status = "ok"
     return {
         "url": url,
-        "status": "failed" if capture.error else "ok",
+        "status": status,
         "content_type": capture.content_type,
         "warc_records": len(capture.responses),
         "error": capture.error,
+        "block_reason": capture.block,
         "page_url": capture.page_url,
         "title": capture.title,
         "fetched_at": main.get("fetched_at") if main else None,
@@ -484,6 +512,7 @@ def capture_article_sources(
     all_responses: list[dict[str, Any]] = []
     succeeded = 0
     failed = 0
+    blocked = 0
 
     # Save the article HTML as a standalone readable file.
     article_html_path.write_bytes(article_bytes)
@@ -511,9 +540,15 @@ def capture_article_sources(
             log.info("Capturing article source %d/%d: %s", i + 1, len(remote_urls), url)
 
             capture = _capture_source(url, timeout)
+            # Block pages stay in the WARC as evidence of the attempt, but
+            # are left out of the page list so replay never presents them
+            # as the source.
             all_responses.extend(capture.responses)
             if capture.error:
                 failed += 1
+            elif capture.block:
+                blocked += 1
+                log.warning("Source blocked: %s (%s)", url, capture.block)
             else:
                 succeeded += 1
                 source_captures.append(capture)
@@ -580,6 +615,7 @@ def capture_article_sources(
             "total_sources": len(remote_urls),
             "succeeded": succeeded,
             "failed": failed,
+            "blocked": blocked,
             "total_warc_records": total_warc_records,
             "bundle_size_bytes": bundle_size_bytes,
         },
@@ -602,6 +638,7 @@ def capture_article_sources(
         "remote_sources": len(remote_urls),
         "succeeded": succeeded,
         "failed": failed,
+        "blocked": blocked,
         "sources": sources,
         "captured_at": captured_at,
         "bundle_size_bytes": bundle_size_bytes,

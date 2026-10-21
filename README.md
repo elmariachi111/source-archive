@@ -78,12 +78,38 @@ captures the article and every external source it links to into
   (`archive/bundle.warc.gz`, every record dated with its real fetch time), a CDXJ index,
   and a page list with the article first (titled `Article: …`) followed by each source
 - `article.html` — the article's raw HTML
-- `sources.json` — per-source status, final URL, title, and fetch time
+- `sources.json` — per-source status (`ok` / `blocked` / `failed`), final URL, title,
+  fetch time, and `block_reason` for blocked sources
 
 To browse a bundle, open https://replayweb.page and choose `bundle.wacz` (it is read
 locally in the browser, nothing is uploaded), or use the ReplayWeb.page desktop app.
 The WARC can be extracted with `unzip bundle.wacz archive/bundle.warc.gz` for tools
 that need a plain WARC.
+
+## Blocked sources
+
+Some sites refuse automated browsers (Cloudflare, Akamai, AWS WAF) or whole
+countries (CloudFront geo restrictions). Pages are rendered with Chromium in
+new-headless mode, with the automation flag off and no `HeadlessChrome` in the
+user agent. That gets past most bot walls.
+
+If a page still comes back as a block page and the `stealth` extra is installed,
+it is rendered again with [Camoufox](https://camoufox.com), a fingerprint-hardened
+Firefox:
+
+```bash
+uv sync --extra stealth
+uv run python -m camoufox fetch   # once, downloads the browser
+```
+
+A source that stays blocked is marked `blocked` in `sources.json` with a
+`block_reason` such as `geo: CloudFront` or `bot: Cloudflare challenge`. The
+block page is kept in the WARC as evidence of the attempt, but it is left out
+of the page list, so replay never presents it as the source. `article` and
+`capture` exit with status 1 when anything was blocked. Geo blocks need a
+capture from inside the allowed country; until then,
+`source-archive capture <url> --wayback` gets the Internet Archive (which
+crawls from the US) to keep a copy.
 
 ## License
 
