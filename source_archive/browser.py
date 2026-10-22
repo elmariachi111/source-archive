@@ -68,7 +68,9 @@ def open_page(engine: str = CHROMIUM) -> Iterator[Any]:
     if engine == CAMOUFOX:
         from camoufox.sync_api import Camoufox
 
-        with Camoufox(headless=True, humanize=True, locale=LOCALE) as browser:
+        # geoip: timezone and geolocation follow the exit IP. A browser that
+        # claims Berlin time behind a US exit is an easy bot tell.
+        with Camoufox(headless=True, humanize=True, locale=LOCALE, geoip=True) as browser:
             yield browser.new_page()
         return
 

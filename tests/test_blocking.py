@@ -106,3 +106,30 @@ def test_is_challenge_title() -> None:
     assert not is_challenge_title("Attention Required! | Cloudflare")
     assert not is_challenge_title("Just a moment of reflection on data centres")
     assert not is_challenge_title(None)
+
+
+def _outage_article(size: int) -> bytes:
+    """A real article that quotes Akamai's block text verbatim."""
+    quote = b"<blockquote>" + AKAMAI.split(b"<BODY>")[1].split(b"</BODY>")[0] + b"</blockquote>"
+    filler = b"<p>Thousands of sites went dark when the CDN failed.</p>" * (size // 50)
+    return b"<html><head><title>CDN outage takes down Senate sites</title></head><body>" + quote + filler + b"</body></html>"
+
+
+def test_large_successful_page_quoting_block_text_is_not_a_block() -> None:
+    body = _outage_article(60_000)
+    assert detect_block(200, "CDN outage takes down Senate sites", body) is None
+
+
+def test_same_quote_still_counts_on_an_error_status() -> None:
+    assert detect_block(403, None, _outage_article(60_000)) == "bot: Akamai"
+
+
+def test_small_successful_block_page_is_still_detected() -> None:
+    # Some WAFs answer 200 with a tiny interstitial.
+    assert detect_block(200, None, AKAMAI) == "bot: Akamai"
+
+
+def test_large_successful_page_is_still_checked_by_title_and_host() -> None:
+    big = _outage_article(60_000)
+    assert detect_block(200, "Just a moment...", big) == "bot: challenge page"
+    assert detect_block(200, None, big, url="https://unblock.federalregister.gov/") == "bot: Federal Register"

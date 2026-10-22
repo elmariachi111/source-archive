@@ -44,6 +44,11 @@ _BLOCK_STATUSES = {401, 403, 407, 429, 451}
 
 _SCAN_BYTES = 64_000
 
+# Block pages are tiny (0.5-10 KB in practice); articles are 50 KB and up.
+# A 2xx page larger than this is only checked by host and title, so an
+# article that quotes block-page text (outage coverage) isn't flagged.
+_MAX_2XX_BLOCK_PAGE_BYTES = 32_000
+
 
 def detect_block(
     status: int | None,
@@ -59,13 +64,15 @@ def detect_block(
         if host in _BLOCK_HOSTS:
             return _BLOCK_HOSTS[host]
 
-    if isinstance(body, bytes):
-        text = body[:_SCAN_BYTES].decode("utf-8", errors="replace")
-    else:
-        text = (body or "")[:_SCAN_BYTES]
-    for reason, pattern in _BODY_SIGNATURES:
-        if re.search(pattern, text, re.IGNORECASE):
-            return reason
+    successful = status is not None and 200 <= status < 300
+    if not (successful and len(body or "") > _MAX_2XX_BLOCK_PAGE_BYTES):
+        if isinstance(body, bytes):
+            text = body[:_SCAN_BYTES].decode("utf-8", errors="replace")
+        else:
+            text = (body or "")[:_SCAN_BYTES]
+        for reason, pattern in _BODY_SIGNATURES:
+            if re.search(pattern, text, re.IGNORECASE):
+                return reason
 
     if title and title.strip().lower() in CHALLENGE_TITLES:
         return "bot: challenge page"
