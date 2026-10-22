@@ -20,6 +20,8 @@ import trafilatura
 from urllib.parse import urlparse
 
 from . import __version__
+from .blocking import detect_block, is_challenge_title
+from .browser import available_engines, open_page
 from .manifest import (
     artifact_entry,
     build_manifest,
@@ -69,7 +71,7 @@ def _user_agent() -> str:
     """Return the source-archive HTTP User-Agent string."""
     return (
         f"Mozilla/5.0 (compatible; source-archive/{__version__}; "
-        "+https://github.com/climate/source-archive)"
+        "+https://github.com/elmariachi111/source-archive)"
     )
 
 
@@ -373,6 +375,44 @@ SETTLE_TIMEOUT_MS = 15_000
 
 SETTLE_QUIET_MS = 1_500
 SETTLE_POLL_MS = 250
+CHALLENGE_TIMEOUT_MS = 20_000
+
+
+def _challenge_showing(page) -> bool:
+    """True while a bot challenge is up, or the page is mid-navigation."""
+    try:
+        return is_challenge_title(page.title())
+    except Exception:  # noqa: BLE001 — title() fails while the challenge reloads.
+        return True
+
+
+def _wait_for_challenge(page) -> None:
+    """Give a self-resolving bot challenge time to hand over to the real page.
+
+    Cloudflare and AWS WAF serve a JS interstitial first and reload into the
+    page once the browser passes. Gives up after ``CHALLENGE_TIMEOUT_MS``;
+    the caller then sees the challenge as a block.
+    """
+    waited = 0
+    while waited < CHALLENGE_TIMEOUT_MS and _challenge_showing(page):
+        page.wait_for_timeout(SETTLE_POLL_MS * 2)
+        waited += SETTLE_POLL_MS * 2
+    if waited:
+        try:
+            page.wait_for_load_state("networkidle", timeout=SETTLE_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001 — a page that never idles is still usable.
+            pass
+
+
+def _is_main_document(response) -> bool:
+    """True for a navigation response of the top-level frame."""
+    try:
+        return (
+            response.request.is_navigation_request()
+            and response.frame.parent_frame is None
+        )
+    except Exception:  # noqa: BLE001 — service-worker responses have no frame.
+        return False
 
 
 def _wait_until_quiet(page, responses: list[dict[str, Any]]) -> None:
@@ -421,25 +461,54 @@ def _render_and_capture(
     *,
     screenshot: bool = True,
 ) -> dict[str, Any] | None:
-    """Render the page with headless Chromium and capture network traffic.
+    """Render ``url``, escalating to a stealthier engine if the page is blocked.
+
+    Tries each engine from :func:`browser.available_engines` in turn and
+    returns the first result that isn't a block page. If every engine is
+    blocked, returns the last result; its ``block`` key says why. Returns
+    ``None`` if rendering fails outright.
+    """
+    rendered = None
+    for engine in available_engines():
+        rendered = _render_with_engine(
+            url, dest_dir, timeout, screenshot=screenshot, engine=engine
+        )
+        if rendered is None or not rendered["block"]:
+            return rendered
+        log.warning("%s was blocked on %s: %s", engine, url, rendered["block"])
+    return rendered
+
+
+def _render_with_engine(
+    url: str,
+    dest_dir: Path,
+    timeout: int,
+    *,
+    screenshot: bool = True,
+    engine: str = "chromium",
+) -> dict[str, Any] | None:
+    """Render the page with one browser engine and capture network traffic.
 
     Intercepts every HTTP response during ``page.goto()`` and returns a dict
     with:
 
         - ``screenshot``: Path to screenshot.png (``None`` if ``screenshot=False``)
         - ``responses``: list of intercepted response dicts (incl. redirects)
-        - ``main_url``: final URL of the main navigation, after redirects
+        - ``main_url``: final URL of the main document, after redirects
         - ``title``: the rendered page's ``<title>``, or ``None``
-        - ``main_response_status``: status code of the main navigation
-        - ``main_response_headers``: response headers of the main navigation
-        - ``main_content_type``: Content-Type of the main navigation
+        - ``main_response_status``: status code of the main document
+        - ``main_response_headers``: response headers of the main document
+        - ``main_content_type``: Content-Type of the main document
         - ``html``: rendered DOM HTML from ``page.content()``
+        - ``block``: why the page is a block page (see ``detect_block``), or ``None``
 
-    Returns ``None`` if Playwright cannot launch or the page fails to load.
+    The main document is the *last* top-level navigation, so a bot challenge
+    that reloads into the real page reports the real page.
+
+    Returns ``None`` if the browser cannot launch or the page fails to load.
     """
-    from playwright.sync_api import sync_playwright
-
     responses: list[dict[str, Any]] = []
+    main_documents: list[dict[str, Any]] = []
     captured_ok: set[str] = set()
     screenshot_path = dest_dir / SCREENSHOT_NAME if screenshot else None
 
@@ -506,59 +575,70 @@ def _render_and_capture(
                     "Failed to read response body for %s: %s", response.url, exc
                 )
                 return
-        responses.append(
-            {
-                "url": response.url,
-                "status": response.status,
-                "headers": dict(response.headers),
-                "body": body,
-                "fetched_at": fetched_at,
-            }
-        )
+        record = {
+            "url": response.url,
+            "status": response.status,
+            "headers": dict(response.headers),
+            "body": body,
+            "fetched_at": fetched_at,
+        }
+        responses.append(record)
         if 200 <= response.status < 300:
             captured_ok.add(response.url)
+        if _is_main_document(response) and not 300 <= response.status < 400:
+            main_documents.append(record)
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
+        with open_page(engine) as page:
+            page.on("response", _handle_response)
+            # Wait for "load", not "networkidle": bot challenges poll until
+            # they pass, so a challenged page would time out before we get
+            # the chance to wait it out. Idle is still awaited, best effort.
+            main_response = page.goto(url, timeout=timeout * 1000, wait_until="load")
+
+            if main_response is None:
+                log.warning("Navigation returned no response for %s", url)
+                return None
+
             try:
-                page = browser.new_page()
-                page.on("response", _handle_response)
-                main_response = page.goto(
-                    url, timeout=timeout * 1000, wait_until="networkidle"
-                )
+                page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+            except Exception:  # noqa: BLE001 — challenges and live feeds never idle.
+                log.debug("No network idle for %s; continuing", url)
+            _wait_for_challenge(page)
+            _load_deferred_content(page, responses)
 
-                if main_response is None:
-                    log.warning(
-                        "Playwright navigation returned no response for %s", url
-                    )
-                    return None
+            if screenshot_path is not None:
+                screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(screenshot_path), full_page=True)
+            html = page.content()
+            title = page.title() or None
 
-                _load_deferred_content(page, responses)
+            if main_documents:
+                main = main_documents[-1]
+                main_url, main_status = main["url"], main["status"]
+                main_headers = main["headers"]
+            else:
+                main_url, main_status = main_response.url, main_response.status
+                main_headers = main_response.headers
+            main_response_headers = {k.lower(): v for k, v in main_headers.items()}
 
-                if screenshot_path is not None:
-                    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                    page.screenshot(path=str(screenshot_path), full_page=True)
-                html = page.content()
-                main_response_headers = {
-                    k.lower(): v for k, v in main_response.headers.items()
-                }
-
-                return {
-                    "screenshot": screenshot_path,
-                    "responses": responses,
-                    "main_url": main_response.url,
-                    "title": page.title() or None,
-                    "main_response_status": main_response.status,
-                    "main_response_headers": main_response_headers,
-                    "main_content_type": main_response_headers.get("content-type"),
-                    "html": html,
-                }
-            finally:
-                browser.close()
+            return {
+                "screenshot": screenshot_path,
+                "responses": responses,
+                "main_url": main_url,
+                "title": title,
+                "main_response_status": main_status,
+                "main_response_headers": main_response_headers,
+                "main_content_type": main_response_headers.get("content-type"),
+                "html": html,
+                "block": detect_block(
+                    main_status, title, html, url=main_url, headers=main_response_headers
+                ),
+            }
     except Exception as exc:  # noqa: BLE001 — broad on purpose, fall back.
         log.warning(
-            "Playwright render failed for %s: %s — falling back to requests-only.",
+            "%s render failed for %s: %s — falling back to requests-only.",
+            engine,
             url,
             exc,
         )
@@ -639,6 +719,7 @@ def capture_url(
           "manifest_path": str | None,
           "artifacts_dir": str | None,
           "error": str | None,
+          "blocked": str | None,  # why the capture is a block page
         }
     """
     captured_at = utc_now_iso()
@@ -650,6 +731,7 @@ def capture_url(
         "manifest_path": None,
         "artifacts_dir": None,
         "error": None,
+        "blocked": None,
     }
 
     # Determine output directories from the URL hash.
@@ -680,6 +762,9 @@ def capture_url(
         # --- HTML path: Playwright render + WARC + screenshot + article text -----
         rendered = _render_and_capture(url, capture_dir, timeout)
         if rendered:
+            if rendered.get("block"):
+                result["blocked"] = rendered["block"]
+                log.warning("Captured a block page for %s: %s", url, rendered["block"])
             status = rendered["main_response_status"]
             response_headers = rendered["main_response_headers"]
             content_type = rendered["main_content_type"]
