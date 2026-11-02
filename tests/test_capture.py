@@ -335,7 +335,7 @@ def test_render_and_capture_intercepts_responses(tmp_path: Path) -> None:
     page.screenshot = mock.Mock(side_effect=_screenshot)
 
     browser = mock.Mock()
-    browser.new_page.return_value = page
+    browser.new_context.return_value.new_page.return_value = page
 
     playwright_obj = mock.Mock()
     playwright_obj.chromium.launch.return_value = browser
@@ -440,3 +440,145 @@ def test_write_warc_neutralizes_wire_encoding_headers(tmp_path: Path) -> None:
     assert headers.get_header("x-archive-orig-content-encoding") == "gzip"
     assert headers.get_header("x-archive-orig-transfer-encoding") == "chunked"
     assert payloads[1] == body
+
+
+# ---------------------------------------------------------------------------
+# Blocked pages: engine escalation and challenge handling
+# ---------------------------------------------------------------------------
+
+
+def _rendered(block: str | None) -> dict:
+    return {"responses": [], "main_url": "https://example.com/a", "block": block}
+
+
+def test_render_escalates_to_next_engine_when_blocked(tmp_path: Path) -> None:
+    results = {"chromium": _rendered("bot: Cloudflare challenge"), "camoufox": _rendered(None)}
+    with (
+        mock.patch.object(capture_mod, "available_engines", return_value=["chromium", "camoufox"]),
+        mock.patch.object(
+            capture_mod,
+            "_render_with_engine",
+            side_effect=lambda *a, engine, **kw: results[engine],
+        ) as render,
+    ):
+        rendered = capture_mod._render_and_capture("https://example.com/a", tmp_path, 30)
+
+    assert rendered["block"] is None
+    assert [c.kwargs["engine"] for c in render.call_args_list] == ["chromium", "camoufox"]
+
+
+def test_render_returns_last_block_when_every_engine_is_blocked(tmp_path: Path) -> None:
+    results = {"chromium": _rendered("bot: Akamai"), "camoufox": _rendered("geo: CloudFront")}
+    with (
+        mock.patch.object(capture_mod, "available_engines", return_value=["chromium", "camoufox"]),
+        mock.patch.object(
+            capture_mod,
+            "_render_with_engine",
+            side_effect=lambda *a, engine, **kw: results[engine],
+        ),
+    ):
+        rendered = capture_mod._render_and_capture("https://example.com/a", tmp_path, 30)
+
+    assert rendered["block"] == "geo: CloudFront"
+
+
+def test_render_does_not_escalate_on_render_failure(tmp_path: Path) -> None:
+    with (
+        mock.patch.object(capture_mod, "available_engines", return_value=["chromium", "camoufox"]),
+        mock.patch.object(capture_mod, "_render_with_engine", return_value=None) as render,
+    ):
+        assert capture_mod._render_and_capture("https://example.com/a", tmp_path, 30) is None
+    assert render.call_count == 1
+
+
+def _nav_response(url: str, status: int, body: bytes) -> mock.Mock:
+    response = mock.Mock()
+    response.url = url
+    response.status = status
+    response.headers = {"Content-Type": "text/html; charset=utf-8", "Server": "cloudflare"}
+    response.body.return_value = body
+    response.request.is_navigation_request.return_value = True
+    response.frame.parent_frame = None
+    return response
+
+
+def test_render_reports_the_real_page_after_a_challenge_reload(tmp_path: Path) -> None:
+    """A challenge (403) that reloads into the article reports the article."""
+    url = "https://example.com/article"
+    challenge = _nav_response(url, 403, b"<title>Just a moment...</title>")
+    article = _nav_response(url, 200, SAMPLE_HTML.encode())
+    titles = iter(["Just a moment...", "Test Article", "Test Article"])
+    handlers: list = []
+
+    page = mock.Mock()
+    page.on = lambda event, handler: handlers.append(handler)
+
+    def _goto(target, **kwargs):
+        handlers[0](challenge)
+        return challenge
+
+    def _wait(ms):
+        # The challenge passes while we wait and the page reloads.
+        if article not in seen:
+            seen.append(article)
+            handlers[0](article)
+
+    seen: list = []
+    page.goto = mock.Mock(side_effect=_goto)
+    page.wait_for_timeout = mock.Mock(side_effect=_wait)
+    page.title = mock.Mock(side_effect=lambda: next(titles, "Test Article"))
+    page.content = mock.Mock(return_value=SAMPLE_HTML)
+    page.evaluate = mock.Mock(return_value=0)
+
+    with mock.patch.object(capture_mod, "open_page") as open_page:
+        open_page.return_value.__enter__.return_value = page
+        rendered = capture_mod._render_with_engine(url, tmp_path, 30, screenshot=False)
+
+    assert rendered["main_response_status"] == 200
+    assert rendered["title"] == "Test Article"
+    assert rendered["block"] is None
+    # Both exchanges are archived: the challenge as evidence, then the page.
+    assert [r["status"] for r in rendered["responses"]] == [403, 200]
+
+
+def test_render_flags_a_challenge_that_never_resolves(tmp_path: Path) -> None:
+    url = "https://example.com/article"
+    challenge = _nav_response(url, 403, b"<title>Just a moment...</title>")
+    handlers: list = []
+
+    page = mock.Mock()
+    page.on = lambda event, handler: handlers.append(handler)
+    page.goto = mock.Mock(side_effect=lambda target, **kw: (handlers[0](challenge), challenge)[1])
+    page.title = mock.Mock(return_value="Just a moment...")
+    page.content = mock.Mock(return_value="<html><title>Just a moment...</title></html>")
+    page.evaluate = mock.Mock(return_value=0)
+
+    with (
+        mock.patch.object(capture_mod, "open_page") as open_page,
+        mock.patch.object(capture_mod, "CHALLENGE_TIMEOUT_MS", 1_000),
+    ):
+        open_page.return_value.__enter__.return_value = page
+        rendered = capture_mod._render_with_engine(url, tmp_path, 30, screenshot=False)
+
+    assert rendered["main_response_status"] == 403
+    assert rendered["block"] == "bot: Cloudflare challenge"
+
+
+def test_capture_url_reports_blocked_capture(temp_output: Path) -> None:
+    def _blocked_render(url, dest_dir, timeout):
+        rendered = _fake_render_and_capture(url, dest_dir, timeout)
+        rendered["block"] = "bot: Akamai"
+        return rendered
+
+    with (
+        mock.patch.object(capture_mod.requests, "head", side_effect=_fake_requests_head),
+        mock.patch.object(capture_mod, "_render_and_capture", side_effect=_blocked_render),
+    ):
+        result = capture_url("https://example.com/article", output_dir=temp_output)
+
+    assert result["ok"] is True  # the evidence is archived...
+    assert result["blocked"] == "bot: Akamai"  # ...and flagged
+
+
+def test_user_agent_points_at_the_real_repo() -> None:
+    assert "github.com/elmariachi111/source-archive" in capture_mod._user_agent()

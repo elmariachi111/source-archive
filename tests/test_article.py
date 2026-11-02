@@ -471,3 +471,117 @@ def test_article_is_rendered_and_redirect_target_becomes_page(
     assert datapackage["mainPageURL"] == final_url
     # The redirect is indexed, so the cited URL resolves during replay.
     assert any(json.loads(line.split(" ", 2)[2])["status"] == "301" for line in cdxj)
+
+
+# ---------------------------------------------------------------------------
+# Blocked sources
+# ---------------------------------------------------------------------------
+
+
+def _capture_with_one_blocked(url: str, timeout: int) -> SourceCapture:
+    if "other.com" in url:
+        return _one(
+            url,
+            "text/html; charset=utf-8",
+            b"<html><title>Access Denied</title></html>",
+            category="html",
+            title="Access Denied",
+            block="bot: Akamai",
+        )
+    return _fake_capture_source(url, timeout)
+
+
+def test_blocked_source_is_archived_but_not_listed_as_a_page(temp_output: Path) -> None:
+    with (
+        mock.patch.object(article_mod.requests, "get", return_value=_FakeArticleResponse()),
+        mock.patch.object(article_mod, "_capture_source", side_effect=_capture_with_one_blocked),
+    ):
+        result = capture_article_sources(
+            SAMPLE_ARTICLE_URL, output_dir=temp_output, dry_run=False, delay=0.0
+        )
+
+    assert (result["succeeded"], result["failed"], result["blocked"]) == (3, 0, 1)
+    entry = next(s for s in result["sources"] if s["url"] == "https://other.com/news")
+    assert entry["status"] == "blocked"
+    assert entry["block_reason"] == "bot: Akamai"
+
+    summary = json.loads(Path(result["sources_path"]).read_text("utf-8"))
+    assert summary["summary"]["blocked"] == 1
+
+    records, pages, _, _ = _read_bundle(Path(result["bundle_wacz_path"]))
+    warc_urls = [h.get_header("WARC-Target-URI") for t, h, _ in records if t == "response"]
+    assert "https://other.com/news" in warc_urls  # kept as evidence
+    assert "https://other.com/news" not in [p.get("url") for p in pages]
+
+
+def test_requests_fallback_detects_block_pages() -> None:
+    capture = article_mod._single_response_capture(
+        "https://www.axios.com/2026/09/10/x",
+        403,
+        "text/html",
+        {"server": "cloudflare"},
+        b"<html><head><title>Just a moment...</title></head></html>",
+        "html",
+    )
+    assert capture.block == "bot: Cloudflare challenge"
+    assert capture.title == "Just a moment..."
+
+
+def test_main_response_prefers_the_page_after_a_challenge() -> None:
+    url = "https://example.com/a"
+    capture = SourceCapture(
+        responses=[
+            {"url": url, "status": 403, "headers": {}, "body": b"challenge"},
+            {"url": url, "status": 200, "headers": {}, "body": b"article"},
+        ],
+        page_url=url,
+    )
+    assert capture.main_response()["body"] == b"article"
+
+
+def test_blocked_article_falls_back_to_requests(temp_output: Path, no_browser) -> None:
+    no_browser.return_value = {
+        "responses": [{"url": SAMPLE_ARTICLE_URL, "status": 200,
+                       "headers": {"content-type": "text/html"},
+                       "body": b"<title>Just a moment...</title>"}],
+        "main_url": SAMPLE_ARTICLE_URL,
+        "title": "Just a moment...",
+        "main_response_status": 200,
+        "main_content_type": "text/html",
+        "block": "bot: challenge page",
+    }
+    with mock.patch.object(
+        article_mod.requests, "get", return_value=_FakeArticleResponse()
+    ) as requests_get:
+        _, html_text, _ = article_mod._capture_article(SAMPLE_ARTICLE_URL, 30)
+
+    requests_get.assert_called_once()
+    assert html_text == SAMPLE_HTML
+
+
+def test_cli_article_reports_blocked_sources(temp_output: Path) -> None:
+    from click.testing import CliRunner
+    from source_archive.cli import cli
+
+    fake_result = {
+        "article_url": SAMPLE_ARTICLE_URL,
+        "article_domain": "example.com",
+        "output_dir": str(temp_output),
+        "sources_path": str(temp_output / "sources.json"),
+        "total_links": 1,
+        "excluded": {"internal": 0, "social": 0, "duplicates": 0},
+        "remote_sources": 1,
+        "succeeded": 0,
+        "failed": 0,
+        "blocked": 1,
+        "sources": [
+            {"url": "https://clearinghouse.net/case/48273/", "status": "blocked",
+             "block_reason": "geo: CloudFront", "warc_records": 1, "error": None},
+        ],
+    }
+    with mock.patch("source_archive.cli.capture_article_sources", return_value=fake_result):
+        invoke = CliRunner().invoke(cli, ["article", SAMPLE_ARTICLE_URL])
+
+    assert invoke.exit_code == 1, invoke.output
+    assert "BLOCKED (geo: CloudFront)" in invoke.output
+    assert "0 failed, 1 blocked" in invoke.output

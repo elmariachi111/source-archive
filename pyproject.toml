@@ -20,6 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# Fingerprint-hardened Firefox, tried when Chromium hits a bot wall.
+# After installing, fetch the browser once: `python -m camoufox fetch`.
+stealth = ["camoufox[geoip]>=0.4"]
 
 [project.scripts]
 source-archive = "source_archive.cli:cli"

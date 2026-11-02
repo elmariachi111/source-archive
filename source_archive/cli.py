@@ -56,6 +56,11 @@ def capture(url: str, wayback: bool, output_dir: str, timeout: int) -> None:
     out = normalize_output_dir(Path(output_dir))
     click.echo(f"Capturing {url} → {out}/ ...")
     result = capture_url(url, output_dir=out, wayback=wayback, timeout=timeout)
+    if result["ok"] and result.get("blocked"):
+        click.secho(f"BLOCKED ({result['blocked']})", fg="yellow", bold=True)
+        click.echo("  the stored capture is the block page, not the source")
+        click.echo(f"  manifest:  {result['manifest_path']}")
+        sys.exit(1)
     if result["ok"]:
         click.secho("OK", fg="green", bold=True)
         click.echo(f"  manifest:  {result['manifest_path']}")
@@ -171,21 +176,36 @@ def article(url_or_file: str, wayback: bool, output_dir: str, timeout: int, dry_
             click.echo(
                 f"  [{i}/{total}] {source['url']} → FAIL ({source.get('error') or 'unknown error'})"
             )
+        elif status == "blocked":
+            click.secho(
+                f"  [{i}/{total}] {source['url']} → BLOCKED ({source.get('block_reason')})",
+                fg="yellow",
+            )
         else:
             click.echo(f"  [{i}/{total}] {source['url']} → {status}")
 
+    blocked = result.get("blocked", 0)
     click.echo("")
     click.secho(
-        f"Done: {result['succeeded']}/{result['remote_sources']} captured successfully, {result['failed']} failed",
+        f"Done: {result['succeeded']}/{result['remote_sources']} captured successfully, "
+        f"{result['failed']} failed, {blocked} blocked",
         bold=True,
     )
+    if blocked:
+        click.echo(
+            "  Blocked sources are kept in the WARC as evidence but left out of the page list."
+        )
+        click.echo(
+            "  Bot blocks: install the stealth extra (Camoufox). Geo blocks: capture from the"
+            " allowed country, or `source-archive capture <url> --wayback`."
+        )
     click.echo(f"Bundle (WACZ): {result.get('bundle_wacz_path') or 'bundle.wacz'}")
     click.echo("  open it at https://replayweb.page (loads locally, nothing is uploaded)")
     click.echo(f"Article HTML: {result.get('article_html_path') or 'article.html'}")
     click.echo(f"Sources index: {result['sources_path']}")
     click.echo(f"Captures stored in: {result['output_dir']}")
 
-    if result["failed"]:
+    if result["failed"] or blocked:
         sys.exit(1)
 
 
